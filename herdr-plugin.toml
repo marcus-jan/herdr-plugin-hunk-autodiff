@@ -1,0 +1,10 @@
+id = "hunk.autodiff"
+name = "Hunk Auto Diff"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Open a hunk diff split when a coding agent finishes with working-tree changes."
+platforms = ["macos", "linux"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "autodiff.py"]
