@@ -1,10 +1,26 @@
 id = "hunk.autodiff"
 name = "Hunk Auto Diff"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.0"
-description = "Open a hunk diff split when a coding agent finishes with working-tree changes."
+description = "Keep a background hunk diff tab of everything changed since the branch baseline when a coding agent finishes."
 platforms = ["macos", "linux"]
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["python3", "autodiff.py"]
+command = ["python3", "autodiff.py", "event"]
+
+[[events]]
+on = "worktree.created"
+command = ["python3", "autodiff.py", "event"]
+
+[[actions]]
+id = "open"
+title = "Hunk: open diff tab"
+contexts = ["workspace"]
+command = ["python3", "autodiff.py", "open"]
+
+[[actions]]
+id = "reset-baseline"
+title = "Hunk: reset diff baseline to HEAD"
+contexts = ["workspace"]
+command = ["python3", "autodiff.py", "reset"]
