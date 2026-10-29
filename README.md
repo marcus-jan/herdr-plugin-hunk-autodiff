@@ -8,7 +8,9 @@ Herdr plugin that keeps [hunk](https://github.com/modem-dev/hunk) review tabs in
 | `diff` | Everything changed on the branch since its baseline | No open PR for the branch |
 | `unpushed` | Commits not yet pushed (`@{upstream}...HEAD`) | The branch has an upstream and is ahead of it |
 | `uncommitted` | Staged, unstaged, and untracked changes vs `HEAD` | The working tree is dirty |
-| `turn` | What the agent changed in its last turn | The last turn changed something |
+| `<tab> · turn` | What the agent in `<tab>` changed in its last turn | That agent's last turn changed something |
+
+`pr`, `diff`, `unpushed`, and `uncommitted` describe the checkout, so there's one of each per workspace and checkout, shared by every agent tab working there. Turn tabs belong to one agent tab and are named after it (`origin · turn`, `1 · turn`), so several agent sessions in one checkout each get their own.
 
 > Fork of [scott306lr/herdr-plugin-hunk-autodiff](https://github.com/scott306lr/herdr-plugin-hunk-autodiff), which opens a right-hand split of uncommitted changes.
 
@@ -23,7 +25,7 @@ herdr plugin install marcus-jan/herdr-plugin-hunk-autodiff
 When the agent in a pane becomes `working`, the plugin snapshots the working tree (for the `turn` tab). When it becomes `idle` or `done`:
 
 1. Resolves the pane's git checkout and branch. Detached `HEAD` or no repo: exits silently.
-2. Computes each view above. Each tab is one per workspace and checkout, opened in the background (`--no-focus`) and reused, never duplicated.
+2. Computes each view above. Tabs open in the background (`--no-focus`) and are reused, never duplicated.
 3. For each kind:
    - **Has content, tab running:** updated in place (patch files are rewritten only when their content changes; hunk `--watch` reloads).
    - **Has content, tab missing or closed:** reopened.
@@ -40,9 +42,10 @@ It skips opening new tabs when you already have your own hunk session open for t
 
 ### Turn tab
 
-- Snapshot is stored as a local ref, `refs/worktree/hunk-autodiff-turn/<branch>`, and removed when the turn ends.
+- One per agent tab, labelled `<agent tab name> · turn`. Renaming the agent tab renames its turn tab at the next turn end; closing the agent tab closes its turn tab.
+- Snapshot is stored per agent tab as a local ref, `refs/worktree/hunk-autodiff-turn-tab/<tab id>`, and removed when the turn ends.
 - `blocked` → `working` keeps the original snapshot, so permission prompts don't split a turn.
-- Several agents working in the same checkout at once blur each other's turns.
+- If two agents edit the same checkout at the same time, each turn tab also includes the other agent's edits made during that turn (the plugin sees file changes, not who made them).
 
 ### Baseline (`diff` tab)
 
@@ -81,7 +84,7 @@ description = "open hunk diff tabs"
 ## Notes
 
 - Herdr runs plugin event hooks with a minimal `PATH`; the plugin resolves `hunk` and `gh` from common install locations (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.bun/bin`).
-- State lives under the plugin state dir (`HERDR_PLUGIN_STATE_DIR`): `tabs.json` maps workspace + checkout + kind to its tab, and `patches/` holds the patch files the `pr`, `unpushed`, and `turn` tabs watch.
+- State lives under the plugin state dir (`HERDR_PLUGIN_STATE_DIR`): `tabs.json` maps workspace + checkout + kind (+ agent tab, for turn tabs) to its tab, and `patches/` holds the patch files the `pr`, `unpushed`, and `turn` tabs watch.
 - To drop a baseline entirely: `git update-ref -d refs/worktree/hunk-autodiff/<branch>`.
 
 ## License

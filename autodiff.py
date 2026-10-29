@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Herdr plugin: keep background hunk review tabs for a checkout.
 
-Each workspace + checkout gets at most one tab of each kind, opened in the
-background whenever an agent finishes a turn:
+Each workspace + checkout gets at most one tab of each kind (turn tabs: one
+per agent tab), opened in the background whenever an agent finishes a turn:
 
 - pr #<n>:     the open GitHub PR's diff (`gh pr diff`), as GitHub sees it.
 - diff:        fallback when there is no open PR: everything changed since the
                branch baseline (`hunk diff <baseline> --watch`).
 - unpushed:    local commits not on the upstream branch yet.
 - uncommitted: staged, unstaged and untracked changes vs HEAD.
-- turn:        what the agent changed during its last turn (frozen snapshot).
+- <tab> · turn: what the agent in <tab> changed during its last turn (frozen
+               snapshot). One per agent tab, named after it, so several agent
+               tabs in one checkout don't share or clobber each other.
 
 A tab is updated in place when it is already running hunk, (re)opened when
 its view has content, and closed when the view becomes empty.
@@ -46,11 +48,10 @@ import time
 from typing import Any
 
 REF_PREFIX = "refs/worktree/hunk-autodiff/"
-TURN_REF_PREFIX = "refs/worktree/hunk-autodiff-turn/"
+TURN_REF_PREFIX = "refs/worktree/hunk-autodiff-turn-tab/"
 PANE_NAME = "hunk"
 TRIGGER_STATUSES = {"idle", "done"}
 TURN_START_STATUS = "working"
-KINDS = ("pr", "diff", "unpushed", "uncommitted", "turn")
 MAIN_KINDS = ("pr", "diff")
 KEEP = object()  # view state unknown (e.g. GitHub unreachable): leave the tab alone
 
@@ -128,6 +129,14 @@ def short_hash(text: str) -> str:
 
 def tab_key(workspace_id: str, root: str, kind: str) -> str:
     return workspace_id + "|" + root + "|" + kind
+
+
+def turn_kind(source_tab: str) -> str:
+    return "turn|" + source_tab
+
+
+def safe_name(text: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "-" for c in text)
 
 
 def load_tabs() -> dict[str, Any]:
@@ -357,14 +366,14 @@ def snapshot_tree(root: str) -> str | None:
     return out.strip() if out else None
 
 
-def turn_ref(branch: str) -> str:
-    return TURN_REF_PREFIX + branch
+def turn_ref(source_tab: str) -> str:
+    return TURN_REF_PREFIX + safe_name(source_tab)
 
 
-def start_turn(root: str, branch: str) -> None:
+def start_turn(root: str, source_tab: str) -> None:
     # Repeated `working` reports within a turn (e.g. after a permission
     # prompt) keep the snapshot from the turn's start.
-    if rev(root, turn_ref(branch)):
+    if rev(root, turn_ref(source_tab)):
         return
     tree = snapshot_tree(root)
     if not tree:
@@ -376,23 +385,24 @@ def start_turn(root: str, branch: str) -> None:
     }
     commit = (git(root, ["commit-tree", tree, "-m", "hunk-autodiff turn start"], env=env) or "").strip()
     if commit:
-        git(root, ["update-ref", turn_ref(branch), commit])
+        git(root, ["update-ref", turn_ref(source_tab), commit])
 
 
-def turn_view(root: str, branch: str) -> Any:
-    start = rev(root, turn_ref(branch))
+def turn_view(root: str, source_tab: str, source_label: str) -> Any:
+    start = rev(root, turn_ref(source_tab))
     if not start:
         return KEEP  # no snapshot for this turn: keep showing the previous one
     now = snapshot_tree(root)
     if not now:
         return KEEP
     content = git(root, ["diff", "--no-ext-diff", "--find-renames", start, now]) or ""
-    git(root, ["update-ref", "-d", turn_ref(branch)])
-    return patch_view(root, "turn", "turn", content)
+    git(root, ["update-ref", "-d", turn_ref(source_tab)])
+    return patch_view(root, "turn-" + safe_name(source_tab), f"{source_label} · turn", content)
 
 
 def compute_views(
-    workspace_id: str, root: str, branch: str, *, force_main: bool, end_turn: bool,
+    workspace_id: str, root: str, branch: str, *, force_main: bool,
+    source: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     baseline = ensure_baseline(root, branch)
     views: dict[str, Any] = {"pr": pr_view(root)}
@@ -407,7 +417,9 @@ def compute_views(
         views["diff"] = None
     views["unpushed"] = unpushed_view(root)
     views["uncommitted"] = uncommitted_view(root)
-    views["turn"] = turn_view(root, branch) if end_turn else KEEP
+    if source:
+        views["turn"] = None  # 0.3.0 kept one shared turn tab per checkout
+        views[turn_kind(source[0])] = turn_view(root, *source)
     return views
 
 
@@ -489,9 +501,14 @@ def sync_checkout(workspace_id: str, root: str, views: dict[str, Any], *, focus:
     tabs = load_tabs()
     pending: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
 
-    for kind in KINDS:
+    prefix = tab_key(workspace_id, root, turn_kind(""))
+    for key in [k for k in tabs if k.startswith(prefix)]:
+        # The agent tab this turn tab belongs to is gone.
+        if not herdr(["tab", "get", key[len(prefix):]], fatal=False):
+            close_tab(tabs.pop(key))
+
+    for kind, view in views.items():
         key = tab_key(workspace_id, root, kind)
-        view = views.get(kind, KEEP)
         entry = tabs.get(key)
         if view is KEEP:
             continue
@@ -567,10 +584,17 @@ def on_agent_status(data: dict[str, Any]) -> None:
         branch = current_branch(root)
         if not branch:
             return
-        if status == TURN_START_STATUS:
-            start_turn(root, branch)
+        source_tab = pane.get("tab_id")
+        if not source_tab:
             return
-        views = compute_views(workspace_id, root, branch, force_main=False, end_turn=True)
+        if status == TURN_START_STATUS:
+            start_turn(root, source_tab)
+            return
+        tab = (herdr(["tab", "get", source_tab], fatal=False) or {}).get("result", {}).get("tab", {})
+        source_label = tab.get("label") or str(tab.get("number") or source_tab)
+        views = compute_views(
+            workspace_id, root, branch, force_main=False, source=(source_tab, source_label),
+        )
         sync_checkout(workspace_id, root, views, focus=False)
 
 
@@ -608,7 +632,7 @@ def action_open() -> None:
         branch = current_branch(root)
         if not branch:
             return
-        views = compute_views(workspace_id, root, branch, force_main=True, end_turn=False)
+        views = compute_views(workspace_id, root, branch, force_main=True)
         sync_checkout(workspace_id, root, views, focus=True)
 
 
@@ -624,10 +648,9 @@ def action_reset() -> None:
         set_baseline(root, branch, head)
         if workspace_id:
             tabs = load_tabs()
-            for kind in KINDS:
-                entry = tabs.pop(tab_key(workspace_id, root, kind), None)
-                if entry:
-                    close_tab(entry)
+            prefix = tab_key(workspace_id, root, "")
+            for key in [k for k in tabs if k.startswith(prefix)]:
+                close_tab(tabs.pop(key))
             save_tabs(tabs)
 
 
