@@ -1,24 +1,35 @@
 #!/usr/bin/env python3
-"""Herdr plugin: keep a background hunk diff tab against a fixed baseline.
+"""Herdr plugin: keep background hunk review tabs for a checkout.
+
+Each workspace + checkout gets at most one tab of each kind, opened in the
+background whenever an agent finishes a turn:
+
+- pr #<n>:     the open GitHub PR's diff (`gh pr diff`), as GitHub sees it.
+- diff:        fallback when there is no open PR: everything changed since the
+               branch baseline (`hunk diff <baseline> --watch`).
+- unpushed:    local commits not on the upstream branch yet.
+- uncommitted: staged, unstaged and untracked changes vs HEAD.
+- turn:        what the agent changed during its last turn (frozen snapshot).
+
+A tab is updated in place when it is already running hunk, (re)opened when
+its view has content, and closed when the view becomes empty.
 
 Event hooks
-- pane.agent_status_changed: when an agent goes idle/done and its checkout
-  differs from the branch baseline, open (or refresh) a background "diff" tab
-  in that workspace running `hunk diff <baseline> --watch`.
+- pane.agent_status_changed: `working` snapshots the working tree for the turn
+  tab; `idle`/`done` refreshes every tab for the pane's checkout.
 - worktree.created: record the new worktree's starting commit as its baseline.
 
 Actions (argv[1])
-- open:  open or refresh the diff tab for the focused checkout and focus it.
-- reset: move the baseline for the focused checkout to its current HEAD.
+- open:  open or refresh every tab for the focused checkout and focus the main
+         one (pr, else diff).
+- reset: move the baseline for the focused checkout to its current HEAD and
+         close its tabs.
 
 The baseline is stored per worktree and branch as a local ref
 (refs/worktree/hunk-autodiff/<branch>), so it survives commits, pushes and
 gc, and is never pushed. It is inferred on first sight as the merge-base with
 the default branch, and follows that merge-base forward on feature branches
 (rebase or merge from the default branch) but never moves backwards.
-
-Closing the diff tab (or quitting hunk) keeps it closed until the cumulative
-diff against the baseline changes.
 """
 from __future__ import annotations
 
@@ -30,13 +41,18 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
 REF_PREFIX = "refs/worktree/hunk-autodiff/"
-TAB_LABEL = "diff"
+TURN_REF_PREFIX = "refs/worktree/hunk-autodiff-turn/"
 PANE_NAME = "hunk"
 TRIGGER_STATUSES = {"idle", "done"}
+TURN_START_STATUS = "working"
+KINDS = ("pr", "diff", "unpushed", "uncommitted", "turn")
+MAIN_KINDS = ("pr", "diff")
+KEEP = object()  # view state unknown (e.g. GitHub unreachable): leave the tab alone
 
 
 def herdr(args: list[str], fatal: bool = True) -> dict[str, Any] | None:
@@ -55,10 +71,10 @@ def herdr(args: list[str], fatal: bool = True) -> dict[str, Any] | None:
     return payload
 
 
-def git(cwd: str, args: list[str]) -> str | None:
+def git(cwd: str, args: list[str], env: dict[str, str] | None = None) -> str | None:
     result = subprocess.run(
         ["git", "-C", cwd, *args],
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
     )
     return result.stdout if result.returncode == 0 else None
 
@@ -72,21 +88,30 @@ def rev(cwd: str, name: str) -> str | None:
     return out.strip() if out else None
 
 
-def find_hunk() -> str | None:
+def find_bin(name: str) -> str | None:
     # The herdr server runs hooks with a minimal PATH; check the usual
     # install locations (including bun's global bin) before giving up.
-    found = shutil.which("hunk")
+    found = shutil.which(name)
     if found:
         return found
     for candidate in (
-        "/opt/homebrew/bin/hunk",
-        "/usr/local/bin/hunk",
-        os.path.expanduser("~/.local/bin/hunk"),
-        os.path.expanduser("~/.bun/bin/hunk"),
+        f"/opt/homebrew/bin/{name}",
+        f"/usr/local/bin/{name}",
+        os.path.expanduser(f"~/.local/bin/{name}"),
+        os.path.expanduser(f"~/.bun/bin/{name}"),
     ):
         if os.access(candidate, os.X_OK):
             return candidate
     return None
+
+
+def find_hunk() -> str | None:
+    return find_bin("hunk")
+
+
+def hunk_prefix() -> str:
+    hunk = find_hunk()
+    return shlex.quote(hunk) if hunk else "bunx hunkdiff"
 
 
 # --- state -----------------------------------------------------------------
@@ -101,13 +126,26 @@ def short_hash(text: str) -> str:
     return hashlib.sha1(text.encode()).hexdigest()[:16]
 
 
+def tab_key(workspace_id: str, root: str, kind: str) -> str:
+    return workspace_id + "|" + root + "|" + kind
+
+
 def load_tabs() -> dict[str, Any]:
     try:
         with open(os.path.join(state_dir(), "tabs.json")) as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    # 0.2.x stored one "diff" tab per workspace + checkout.
+    for key in [k for k in data if k.count("|") == 1]:
+        entry = data.pop(key)
+        if isinstance(entry, dict) and entry.get("baseline"):
+            entry.setdefault("command", baseline_command(entry["baseline"]))
+            entry.setdefault("label", "diff")
+        data.setdefault(key + "|diff", entry)
+    return data
 
 
 def save_tabs(tabs: dict[str, Any]) -> None:
@@ -118,28 +156,24 @@ def save_tabs(tabs: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def seen_path(root: str, branch: str) -> str:
-    return os.path.join(state_dir(), "seen-" + short_hash(root + "\0" + branch))
+def patch_path(root: str, kind: str) -> str:
+    directory = os.path.join(state_dir(), "patches")
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, f"{kind}-{short_hash(root)}.patch")
 
 
-def read_seen(root: str, branch: str) -> str:
+def write_patch(path: str, content: str) -> None:
+    """Rewrite only on change, so `hunk patch --watch` doesn't reload needlessly."""
     try:
-        with open(seen_path(root, branch)) as f:
-            return f.read().strip()
-    except OSError:
-        return ""
-
-
-def write_seen(root: str, branch: str, signature: str) -> None:
-    with open(seen_path(root, branch), "w") as f:
-        f.write(signature)
-
-
-def clear_seen(root: str, branch: str) -> None:
-    try:
-        os.remove(seen_path(root, branch))
+        with open(path) as f:
+            if f.read() == content:
+                return
     except OSError:
         pass
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(content)
+    os.replace(tmp, path)
 
 
 class Lock:
@@ -157,9 +191,9 @@ class Lock:
 
 # --- baseline --------------------------------------------------------------
 
-def current_branch(root: str) -> str:
+def current_branch(root: str) -> str | None:
     out = git(root, ["symbolic-ref", "--quiet", "--short", "HEAD"])
-    return out.strip() if out else "HEAD-detached"
+    return out.strip() if out else None
 
 
 def baseline_ref(branch: str) -> str:
@@ -224,49 +258,182 @@ def ensure_baseline(root: str, branch: str) -> str | None:
     return commit
 
 
-def diff_signature(root: str, baseline: str) -> str | None:
-    """Hash of the cumulative change vs baseline, or None when there is none."""
-    diff = git(root, ["diff", "--no-ext-diff", "--find-renames", baseline]) or ""
+def has_untracked(root: str) -> bool:
     status = git(root, ["status", "--porcelain=v1", "--untracked-files=all"]) or ""
-    untracked = "".join(line + "\n" for line in status.splitlines() if line.startswith("??"))
-    if not diff and not untracked:
+    return any(line.startswith("??") for line in status.splitlines())
+
+
+def worktree_dirty(root: str) -> bool:
+    return bool((git(root, ["status", "--porcelain=v1", "--untracked-files=all"]) or "").strip())
+
+
+# --- views -----------------------------------------------------------------
+# A view is {"label", "command", "patch"?} describing what a tab should show,
+# None when it has nothing to show, or KEEP when that can't be determined.
+
+def baseline_command(baseline: str) -> str:
+    return f"{hunk_prefix()} diff {baseline[:12]} --watch"
+
+
+def patch_view(root: str, kind: str, label: str, content: str) -> dict[str, Any] | None:
+    if not content.strip():
         return None
-    return hashlib.sha1((baseline + "\0" + diff + "\0" + untracked).encode()).hexdigest()
+    path = patch_path(root, kind)
+    return {
+        "label": label,
+        "command": f"{hunk_prefix()} patch {shlex.quote(path)} --watch",
+        "patch": (path, content),
+    }
+
+
+def pr_view(root: str) -> Any:
+    gh = find_bin("gh")
+    if not gh:
+        return None
+    try:
+        info = subprocess.run(
+            [gh, "pr", "view", "--json", "number,state"],
+            cwd=root, text=True, capture_output=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return KEEP
+    if info.returncode != 0:
+        return None if "no pull requests found" in info.stderr.lower() else KEEP
+    try:
+        pr = json.loads(info.stdout)
+    except json.JSONDecodeError:
+        return KEEP
+    if pr.get("state") != "OPEN":
+        return None
+    number = str(pr["number"])
+    try:
+        diff = subprocess.run(
+            [gh, "pr", "diff", number, "--color", "never"],
+            cwd=root, text=True, capture_output=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return KEEP
+    if diff.returncode != 0:
+        return KEEP
+    return patch_view(root, "pr", f"pr #{number}", diff.stdout)
+
+
+def diff_view(root: str, baseline: str | None, force: bool) -> dict[str, Any] | None:
+    if not baseline:
+        return None
+    changed = git(root, ["diff", "--no-ext-diff", "--quiet", baseline]) is None
+    if not (force or changed or has_untracked(root)):
+        return None
+    return {"label": "diff", "command": baseline_command(baseline)}
+
+
+def unpushed_view(root: str) -> dict[str, Any] | None:
+    if not rev(root, "@{upstream}"):
+        return None
+    ahead = (git(root, ["rev-list", "--count", "@{upstream}..HEAD"]) or "0").strip()
+    if ahead in ("", "0"):
+        return None
+    content = git(root, ["diff", "--no-ext-diff", "--find-renames", "@{upstream}...HEAD"]) or ""
+    return patch_view(root, "unpushed", "unpushed", content)
+
+
+def uncommitted_view(root: str) -> dict[str, Any] | None:
+    if not rev(root, "HEAD") or not worktree_dirty(root):
+        return None
+    return {"label": "uncommitted", "command": f"{hunk_prefix()} diff HEAD --watch"}
+
+
+def snapshot_tree(root: str) -> str | None:
+    """Tree object of the whole working tree (incl. untracked), via a temp index."""
+    index = (git(root, ["rev-parse", "--path-format=absolute", "--git-path", "index"]) or "").strip()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_index = os.path.join(tmp, "index")
+        if index and os.path.exists(index):
+            shutil.copyfile(index, tmp_index)  # reuse stat info: only changed files get hashed
+        env = {**os.environ, "GIT_INDEX_FILE": tmp_index}
+        if git(root, ["add", "-A"], env=env) is None:
+            return None
+        out = git(root, ["write-tree"], env=env)
+    return out.strip() if out else None
+
+
+def turn_ref(branch: str) -> str:
+    return TURN_REF_PREFIX + branch
+
+
+def start_turn(root: str, branch: str) -> None:
+    # Repeated `working` reports within a turn (e.g. after a permission
+    # prompt) keep the snapshot from the turn's start.
+    if rev(root, turn_ref(branch)):
+        return
+    tree = snapshot_tree(root)
+    if not tree:
+        return
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "hunk-autodiff", "GIT_AUTHOR_EMAIL": "hunk-autodiff@localhost",
+        "GIT_COMMITTER_NAME": "hunk-autodiff", "GIT_COMMITTER_EMAIL": "hunk-autodiff@localhost",
+    }
+    commit = (git(root, ["commit-tree", tree, "-m", "hunk-autodiff turn start"], env=env) or "").strip()
+    if commit:
+        git(root, ["update-ref", turn_ref(branch), commit])
+
+
+def turn_view(root: str, branch: str) -> Any:
+    start = rev(root, turn_ref(branch))
+    if not start:
+        return KEEP  # no snapshot for this turn: keep showing the previous one
+    now = snapshot_tree(root)
+    if not now:
+        return KEEP
+    content = git(root, ["diff", "--no-ext-diff", "--find-renames", start, now]) or ""
+    git(root, ["update-ref", "-d", turn_ref(branch)])
+    return patch_view(root, "turn", "turn", content)
+
+
+def compute_views(
+    workspace_id: str, root: str, branch: str, *, force_main: bool, end_turn: bool,
+) -> dict[str, Any]:
+    baseline = ensure_baseline(root, branch)
+    views: dict[str, Any] = {"pr": pr_view(root)}
+    if views["pr"] is KEEP and tab_key(workspace_id, root, "pr") not in load_tabs():
+        # gh failed and there's no PR tab to preserve (often: not a GitHub repo).
+        views["pr"] = None
+    if views["pr"] is KEEP:
+        views["diff"] = KEEP
+    elif views["pr"] is None:
+        views["diff"] = diff_view(root, baseline, force_main)
+    else:
+        views["diff"] = None
+    views["unpushed"] = unpushed_view(root)
+    views["uncommitted"] = uncommitted_view(root)
+    views["turn"] = turn_view(root, branch) if end_turn else KEEP
+    return views
 
 
 # --- herdr panes -----------------------------------------------------------
 
-def foreground_cmdlines(pane_id: str) -> list[str]:
+def foreground_processes(pane_id: str) -> list[dict[str, Any]]:
     info = herdr(["pane", "process-info", "--pane", pane_id], fatal=False)
     if not info:
         return []
-    procs = info["result"]["process_info"].get("foreground_processes") or []
-    return [p.get("cmdline") or "" for p in procs]
+    return info["result"]["process_info"].get("foreground_processes") or []
 
 
 def hunk_running(pane_id: str) -> bool:
-    return any("hunk" in c for c in foreground_cmdlines(pane_id))
+    return any("hunk" in (p.get("cmdline") or "") for p in foreground_processes(pane_id))
 
 
 def pane_alive(pane_id: str) -> bool:
     return herdr(["pane", "get", pane_id], fatal=False) is not None
 
 
-def hunk_command(baseline: str) -> str:
-    hunk = find_hunk()
-    target = baseline[:12]
-    if hunk:
-        return f"{shlex.quote(hunk)} diff {target} --watch"
-    return f"bunx hunkdiff diff {target} --watch"
-
-
-def launch_hunk(pane_id: str, baseline: str) -> None:
+def launch_hunk(pane_id: str, command: str) -> None:
     # `pane run` types the command into the pane's shell; sending it before
     # the shell is ready silently drops the input, so wait, then verify and
     # retry once.
-    command = hunk_command(baseline)
     for _ in range(20):
-        if foreground_cmdlines(pane_id):
+        if foreground_processes(pane_id):
             break
         time.sleep(0.25)
     time.sleep(0.3)
@@ -278,84 +445,101 @@ def launch_hunk(pane_id: str, baseline: str) -> None:
                 return
 
 
-def tab_key(workspace_id: str, root: str) -> str:
-    return workspace_id + "|" + root
-
-
 def close_tab(entry: dict[str, Any]) -> None:
     if entry.get("tab_id"):
         herdr(["tab", "close", entry["tab_id"]], fatal=False)
 
 
-def open_tab(workspace_id: str, root: str, baseline: str, focus: bool) -> dict[str, Any] | None:
+def open_tab(workspace_id: str, root: str, label: str) -> dict[str, Any] | None:
     created = herdr([
         "tab", "create", "--workspace", workspace_id, "--cwd", root,
-        "--label", TAB_LABEL, "--focus" if focus else "--no-focus",
+        "--label", label, "--no-focus",
     ], fatal=False)
     if not created:
         return None
     result = created["result"]
-    entry = {
-        "tab_id": result["tab"]["tab_id"],
-        "pane_id": result["root_pane"]["pane_id"],
-        "baseline": baseline,
-    }
+    entry = {"tab_id": result["tab"]["tab_id"], "pane_id": result["root_pane"]["pane_id"]}
     herdr(["pane", "rename", entry["pane_id"], PANE_NAME], fatal=False)
     return entry
 
 
-def sync_tab(
-    workspace_id: str, root: str, baseline: str, *, focus: bool, respect_closed: bool,
-    signature: str | None,
-) -> None:
-    """Make sure the workspace's diff tab shows hunk against `baseline`."""
-    branch = current_branch(root)
-    tabs = load_tabs()
-    key = tab_key(workspace_id, root)
-    entry = tabs.get(key)
-    alive = bool(entry) and pane_alive(entry["pane_id"])
-
-    if alive and entry.get("baseline") != baseline:
-        # hunk can't change its base in place; replace the tab.
-        close_tab(entry)
-        alive = False
-
-    if alive and hunk_running(entry["pane_id"]):
-        if focus:
-            herdr(["tab", "focus", entry["tab_id"]], fatal=False)
-        return
-
-    if respect_closed and signature is not None and read_seen(root, branch) == signature:
-        return
-
-    if not alive:
-        if not focus and not entry and live_foreign_session(root):
-            return
-        entry = open_tab(workspace_id, root, baseline, focus)
-        if not entry:
-            return
-    elif focus:
-        herdr(["tab", "focus", entry["tab_id"]], fatal=False)
-
-    # Record before the launch dance so a transient failure there can't leave
-    # this diff unrecorded (which would reopen tabs on every idle).
-    if signature is not None:
-        write_seen(root, branch, signature)
-    tabs[key] = entry
-    save_tabs(tabs)
-    launch_hunk(entry["pane_id"], baseline)
-
-
-def live_foreign_session(root: str) -> bool:
+def foreign_session(root: str, tabs: dict[str, Any]) -> bool:
     """A hunk session the user opened themselves for this repo."""
     hunk = find_hunk()
     if not hunk:
         return False
-    probe = subprocess.run(
-        [hunk, "session", "get", "--repo", root],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    return probe.returncode == 0
+    listed = subprocess.run([hunk, "session", "list", "--json"], text=True, capture_output=True)
+    try:
+        sessions = json.loads(listed.stdout).get("sessions") or []
+    except (json.JSONDecodeError, AttributeError):
+        return False
+    pids = [s.get("pid") for s in sessions if s.get("repoRoot") == root]
+    if not pids:
+        return False
+    ours = {
+        p.get("pid")
+        for key, entry in tabs.items()
+        if key.split("|")[1:2] == [root] and entry.get("pane_id")
+        for p in foreground_processes(entry["pane_id"])
+    }
+    return any(pid not in ours for pid in pids)
+
+
+def sync_checkout(workspace_id: str, root: str, views: dict[str, Any], *, focus: bool) -> None:
+    tabs = load_tabs()
+    pending: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+
+    for kind in KINDS:
+        key = tab_key(workspace_id, root, kind)
+        view = views.get(kind, KEEP)
+        entry = tabs.get(key)
+        if view is KEEP:
+            continue
+        alive = bool(entry) and pane_alive(entry["pane_id"])
+        if view is None:
+            if alive:
+                close_tab(entry)
+            tabs.pop(key, None)
+            continue
+        if "patch" in view:
+            write_patch(*view["patch"])
+        if alive and entry.get("command") != view["command"]:
+            # hunk can't change its input in place; replace the tab.
+            close_tab(entry)
+            alive = False
+        if alive:
+            if entry.get("label") != view["label"]:
+                herdr(["tab", "rename", entry["tab_id"], view["label"]], fatal=False)
+                entry["label"] = view["label"]
+            if not hunk_running(entry["pane_id"]):
+                pending.append((key, entry, view))
+            continue
+        tabs.pop(key, None)
+        pending.append((key, {}, view))
+
+    if any(not entry for _, entry, _ in pending) and not focus and foreign_session(root, tabs):
+        pending = [p for p in pending if p[1]]
+
+    # Record tabs before the launch dance so a failure there can't orphan them.
+    launches = []
+    for key, entry, view in pending:
+        if not entry:
+            entry = open_tab(workspace_id, root, view["label"])
+            if not entry:
+                continue
+        entry.update(label=view["label"], command=view["command"])
+        tabs[key] = entry
+        launches.append(entry)
+    save_tabs(tabs)
+    for entry in launches:
+        launch_hunk(entry["pane_id"], entry["command"])
+
+    if focus:
+        for kind in MAIN_KINDS:
+            entry = tabs.get(tab_key(workspace_id, root, kind))
+            if entry:
+                herdr(["tab", "focus", entry["tab_id"]], fatal=False)
+                break
 
 
 # --- entrypoints -----------------------------------------------------------
@@ -368,7 +552,8 @@ def repo_root(cwd: str | None) -> str | None:
 
 
 def on_agent_status(data: dict[str, Any]) -> None:
-    if data.get("agent_status") not in TRIGGER_STATUSES:
+    status = data.get("agent_status")
+    if status not in TRIGGER_STATUSES and status != TURN_START_STATUS:
         return
     pane_id = data.get("pane_id")
     if not pane_id:
@@ -380,14 +565,13 @@ def on_agent_status(data: dict[str, Any]) -> None:
         return
     with Lock():
         branch = current_branch(root)
-        baseline = ensure_baseline(root, branch)
-        if not baseline:
+        if not branch:
             return
-        signature = diff_signature(root, baseline)
-        if signature is None:
+        if status == TURN_START_STATUS:
+            start_turn(root, branch)
             return
-        sync_tab(workspace_id, root, baseline, focus=False, respect_closed=True,
-                 signature=signature)
+        views = compute_views(workspace_id, root, branch, force_main=False, end_turn=True)
+        sync_checkout(workspace_id, root, views, focus=False)
 
 
 def on_worktree_created(data: dict[str, Any]) -> None:
@@ -397,7 +581,7 @@ def on_worktree_created(data: dict[str, Any]) -> None:
         return
     branch = current_branch(root)
     head = rev(root, "HEAD")
-    if head and not rev(root, baseline_ref(branch)):
+    if branch and head and not rev(root, baseline_ref(branch)):
         set_baseline(root, branch, head)
 
 
@@ -421,10 +605,11 @@ def action_open() -> None:
     if not root or not workspace_id:
         return
     with Lock():
-        baseline = ensure_baseline(root, current_branch(root))
-        if baseline:
-            sync_tab(workspace_id, root, baseline, focus=True, respect_closed=False,
-                     signature=diff_signature(root, baseline))
+        branch = current_branch(root)
+        if not branch:
+            return
+        views = compute_views(workspace_id, root, branch, force_main=True, end_turn=False)
+        sync_checkout(workspace_id, root, views, focus=True)
 
 
 def action_reset() -> None:
@@ -434,16 +619,16 @@ def action_reset() -> None:
     with Lock():
         branch = current_branch(root)
         head = rev(root, "HEAD")
-        if not head:
+        if not branch or not head:
             return
         set_baseline(root, branch, head)
-        clear_seen(root, branch)
         if workspace_id:
             tabs = load_tabs()
-            entry = tabs.pop(tab_key(workspace_id, root), None)
-            if entry:
-                close_tab(entry)
-                save_tabs(tabs)
+            for kind in KINDS:
+                entry = tabs.pop(tab_key(workspace_id, root, kind), None)
+                if entry:
+                    close_tab(entry)
+            save_tabs(tabs)
 
 
 def main() -> None:

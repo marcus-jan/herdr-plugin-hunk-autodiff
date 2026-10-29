@@ -1,8 +1,8 @@
 id = "hunk.autodiff"
 name = "Hunk Auto Diff"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.7.0"
-description = "Keep a background hunk diff tab of everything changed since the branch baseline when a coding agent finishes."
+description = "Keep background hunk tabs of the PR diff, unpushed, uncommitted, and last-turn changes when a coding agent finishes."
 platforms = ["macos", "linux"]
 
 [[events]]
@@ -15,12 +15,12 @@ command = ["python3", "autodiff.py", "event"]
 
 [[actions]]
 id = "open"
-title = "Hunk: open diff tab"
+title = "Hunk: open diff tabs"
 contexts = ["workspace"]
 command = ["python3", "autodiff.py", "open"]
 
 [[actions]]
 id = "reset-baseline"
-title = "Hunk: reset diff baseline to HEAD"
+title = "Hunk: reset diff baseline to HEAD and close tabs"
 contexts = ["workspace"]
 command = ["python3", "autodiff.py", "reset"]

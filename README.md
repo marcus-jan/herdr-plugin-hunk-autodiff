@@ -1,8 +1,14 @@
 # Hunk Auto Diff
 
-Herdr plugin that keeps a [hunk](https://github.com/modem-dev/hunk) diff of **everything changed on the current branch** in a background tab, refreshed whenever a coding agent (Claude Code, Codex, OpenCode, etc.) finishes a turn.
+Herdr plugin that keeps [hunk](https://github.com/modem-dev/hunk) review tabs in the background, refreshed whenever a coding agent (Claude Code, Codex, OpenCode, etc.) finishes a turn:
 
-Unlike a plain `hunk diff`, the diff is taken against a fixed per-branch **baseline**, so it keeps working when the agent commits and pushes as it goes.
+| Tab | Shows | When it exists |
+| --- | --- | --- |
+| `pr #<n>` | The GitHub PR diff (`gh pr diff`), as pushed | The branch has an open PR |
+| `diff` | Everything changed on the branch since its baseline | No open PR for the branch |
+| `unpushed` | Commits not yet pushed (`@{upstream}...HEAD`) | The branch has an upstream and is ahead of it |
+| `uncommitted` | Staged, unstaged, and untracked changes vs `HEAD` | The working tree is dirty |
+| `turn` | What the agent changed in its last turn | The last turn changed something |
 
 > Fork of [scott306lr/herdr-plugin-hunk-autodiff](https://github.com/scott306lr/herdr-plugin-hunk-autodiff), which opens a right-hand split of uncommitted changes.
 
@@ -14,17 +20,31 @@ herdr plugin install marcus-jan/herdr-plugin-hunk-autodiff
 
 ## Behavior
 
-When the agent in a pane becomes `idle` or `done`:
+When the agent in a pane becomes `working`, the plugin snapshots the working tree (for the `turn` tab). When it becomes `idle` or `done`:
 
-1. Resolves the pane's git checkout and branch, and its baseline (see below).
-2. Exits silently unless the working tree (including untracked files) differs from the baseline.
-3. If the workspace already has this plugin's `diff` tab running hunk, does nothing — `--watch` keeps it fresh.
-4. If the cumulative diff is unchanged since the tab was last opened, does nothing — closing the tab or quitting hunk keeps it closed until new changes appear.
-5. Otherwise opens a background tab labelled `diff` (`--no-focus`) running `hunk diff <baseline> --watch`. One tab per workspace and checkout; it is reused, never duplicated.
+1. Resolves the pane's git checkout and branch. Detached `HEAD` or no repo: exits silently.
+2. Computes each view above. Each tab is one per workspace and checkout, opened in the background (`--no-focus`) and reused, never duplicated.
+3. For each kind:
+   - **Has content, tab running:** updated in place (patch files are rewritten only when their content changes; hunk `--watch` reloads).
+   - **Has content, tab missing or closed:** reopened.
+   - **No content:** its tab is closed.
 
-It also skips opening a tab when you already have your own hunk session open for that repo.
+It skips opening new tabs when you already have your own hunk session open for that repo.
 
-### Baseline
+### PR tab
+
+- Uses `gh pr view` / `gh pr diff` for the branch, so `gh` must be installed and authenticated.
+- Only refreshes at turn end — pushes made outside an agent turn show up after the next turn or the `open` action.
+- If `gh` fails transiently, the existing tab is left alone. Repos that aren't on GitHub fall back to the `diff` tab.
+- Branches pushed to a fork may not resolve to their PR.
+
+### Turn tab
+
+- Snapshot is stored as a local ref, `refs/worktree/hunk-autodiff-turn/<branch>`, and removed when the turn ends.
+- `blocked` → `working` keeps the original snapshot, so permission prompts don't split a turn.
+- Several agents working in the same checkout at once blur each other's turns.
+
+### Baseline (`diff` tab)
 
 - Stored per worktree and branch as a local ref, `refs/worktree/hunk-autodiff/<branch>`. It is never pushed and keeps the commit safe from `git gc`.
 - **Captured at creation** for worktrees made with `herdr worktree create` (`worktree.created` event).
@@ -36,8 +56,8 @@ It also skips opening a tab when you already have your own hunk session open for
 
 | Action | What it does |
 | --- | --- |
-| `hunk.autodiff.open` | Open (or refresh) the diff tab for the focused checkout and focus it, even with no changes. |
-| `hunk.autodiff.reset-baseline` | Move the baseline to the current `HEAD` and close the diff tab. Use this to start a fresh review cycle. |
+| `hunk.autodiff.open` | Open (or refresh) all applicable tabs for the focused checkout and focus the `pr` tab (or `diff` if there's no PR), even with no changes. |
+| `hunk.autodiff.reset-baseline` | Move the baseline to the current `HEAD` and close all of the plugin's tabs. Use this to start a fresh review cycle. |
 
 Bind them in `~/.config/herdr/config.toml`:
 
@@ -46,7 +66,7 @@ Bind them in `~/.config/herdr/config.toml`:
 key = "prefix+d"
 type = "plugin_action"
 command = "hunk.autodiff.open"
-description = "open hunk diff tab"
+description = "open hunk diff tabs"
 ```
 
 ## Requirements
@@ -55,12 +75,13 @@ description = "open hunk diff tab"
 - `python3` (stdlib only)
 - `git` 2.20+ (per-worktree refs)
 - `hunk` (or `bunx hunkdiff` as fallback)
+- `gh` (optional, for the PR tab)
 - An agent integration that reports agent state to herdr (`herdr integration install claude`, `codex`, …)
 
 ## Notes
 
-- Herdr runs plugin event hooks with a minimal `PATH`; the plugin resolves `hunk` from common install locations (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.bun/bin`).
-- State lives under the plugin state dir (`HERDR_PLUGIN_STATE_DIR`): `tabs.json` maps workspace + checkout to the diff tab, and one small `seen-*` signature file per checkout and branch.
+- Herdr runs plugin event hooks with a minimal `PATH`; the plugin resolves `hunk` and `gh` from common install locations (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.bun/bin`).
+- State lives under the plugin state dir (`HERDR_PLUGIN_STATE_DIR`): `tabs.json` maps workspace + checkout + kind to its tab, and `patches/` holds the patch files the `pr`, `unpushed`, and `turn` tabs watch.
 - To drop a baseline entirely: `git update-ref -d refs/worktree/hunk-autodiff/<branch>`.
 
 ## License
